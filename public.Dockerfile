@@ -28,4 +28,13 @@ ENV SQLALCHEMY_DATABASE_URI sqlite:///sessions.db
 # You will also need to mount a volume for the clients_secrets.json file.
 
 FROM base as release
+WORKDIR /
+RUN pip3 uninstall -y amundsen-gremlin
+RUN git clone https://github.com/shuichiro-makigaki/amundsengremlin.git
+WORKDIR /amundsengremlin
+RUN git checkout add-dashboard-model
+RUN git submodule update --init
+RUN git submodule status --recursive
+RUN python3 setup.py install
+WORKDIR /app
 RUN python3 setup.py install

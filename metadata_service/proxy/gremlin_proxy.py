@@ -1095,8 +1095,18 @@ class AbstractGremlinProxy(BaseProxy):
                        hasLabel(VertexTypes.Source.value.label).fold()).as_('source')
         g = g.coalesce(select('table').outE(EdgeTypes.Stat.value.label).inV().
                        hasLabel(VertexTypes.Stat.value.label).fold()).as_('stats')
-        g = g.coalesce(select('table').outE(EdgeTypes.Description.value.label).
-                       inV().hasLabel(VertexTypes.Description.value.label).fold()).as_('description')
+        g = g.coalesce(
+            select('table')
+                .outE(EdgeTypes.Description.value.label)
+                .inV()
+                .has(VertexTypes.Description.value.label, 'source', 'user')
+                .fold(),
+            select('table')
+                .outE(EdgeTypes.Description.value.label)
+                .inV()
+                .has(VertexTypes.Description.value.label, 'source', 'description')
+                .fold(),
+        ).as_('description')
         g = g.coalesce(
             select('table').out(EdgeTypes.Description.value.label).hasLabel('Programmatic_Description').fold()
         ).as_('programmatic_descriptions')
@@ -1288,8 +1298,14 @@ class AbstractGremlinProxy(BaseProxy):
         vertex_id: Any = _upsert(executor=executor, g=self.g, label=VertexTypes.Tag, key=tag,
                                  key_property_name=self.key_property_name, tag_type=tag_type)
         vertex_type: VertexTypes = self._get_vertex_type_from_resource_type(resource_type=resource_type)
+
+        if ':' in id.split('://')[0]:
+            id = ':'.join(id.split(':')[1:])
+
         _link(executor=executor, g=self.g, edge_label=EdgeTypes.Tag, key_property_name=self.key_property_name,
               vertex1_id=vertex_id, vertex2_label=vertex_type, vertex2_key=id)
+        _link(executor=executor, g=self.g, edge_label=EdgeTypes.TaggedBy, key_property_name=self.key_property_name,
+              vertex1_label=vertex_type, vertex1_key=id, vertex2_id=vertex_id)
 
     def add_badge(self, *, id: str, badge_name: str, category: str = '',
                   resource_type: ResourceType) -> None:
@@ -1328,9 +1344,18 @@ class AbstractGremlinProxy(BaseProxy):
                     executor: ExecuteQuery) -> None:
         LOGGER.info(f'Expire {tag} for {id}')
         vertex_type: VertexTypes = self._get_vertex_type_from_resource_type(resource_type=resource_type)
+
+        if ':' in id.split('://')[0]:
+            id = ':'.join(id.split(':')[1:])
+
         _expire_link(executor=executor, g=self.g, edge_label=EdgeTypes.Tag,
-                     key_property_name=self.key_property_name, vertex1_label=VertexTypes.Tag,
-                     vertex1_key=tag, vertex2_label=vertex_type, vertex2_key=id)
+                     key_property_name=self.key_property_name,
+                     vertex1_label=VertexTypes.Tag, vertex1_key=tag,
+                     vertex2_label=vertex_type, vertex2_key=id)
+        _expire_link(executor=executor, g=self.g, edge_label=EdgeTypes.TaggedBy,
+                     key_property_name=self.key_property_name,
+                     vertex1_label=vertex_type, vertex1_key=id,
+                     vertex2_label=VertexTypes.Tag, vertex2_key=tag)
 
     @timer_with_counter
     @overrides
@@ -1464,9 +1489,8 @@ class AbstractGremlinProxy(BaseProxy):
         :return:
         """
         g = _V(g=self.g, label=VertexTypes.Tag, key=None).as_('tag'). \
-            outE(EdgeTypes.Tag.value.label).inV().\
-            hasLabel(VertexTypes.Table.value.label).as_('table').\
-            group().by(select('tag').values(self.key_property_name)).by(select('table').dedup().count())
+            outE(EdgeTypes.Tag.value.label).inV().as_('resource').\
+            group().by(select('tag').values(self.key_property_name)).by(select('resource').dedup().count())
         counts = self.query_executor()(query=g, get=FromResultSet.getOnly)
         return [TagDetail(tag_name=name, tag_count=value) for name, value in counts.items()]
 
@@ -1537,7 +1561,55 @@ class AbstractGremlinProxy(BaseProxy):
     @overrides
     def get_dashboard_by_user_relation(self, *, user_email: str, relation_type: UserResourceRel) \
             -> Dict[str, List[DashboardSummary]]:
-        pass
+        g = _V(g=self.g, label=VertexTypes.User, key=user_email).as_('user')
+        if relation_type == UserResourceRel.follow:
+            g = g.outE(EdgeTypes.Follow.value.label).inV()
+        elif relation_type == UserResourceRel.own:
+            g = g.inE(EdgeTypes.Owner.value.label).outV()
+        elif relation_type == UserResourceRel.read:
+            g = g.outE(EdgeTypes.Read.value.label).inV()
+        else:
+            raise NotImplementedError(f'The relation type {relation_type} is not defined!')
+
+        g = g.hasLabel(VertexTypes.Dashboard.value.label).dedup().as_('dashboard')
+        g = g.out(EdgeTypes.DashboardOf.value.label).\
+            hasLabel(VertexTypes.Dashboardgroup.value.label).as_('dashboard_group')
+        g = g.out(EdgeTypes.DashboardGroupOf.value.label).\
+            hasLabel(VertexTypes.Cluster.value.label).as_('cluster')
+        g = g.coalesce(select('dashboard').out(EdgeTypes.Description.value.label).
+                       hasLabel(VertexTypes.Description.value.label).fold()).as_('description')
+        g = g.coalesce(select('dashboard').out(EdgeTypes.Executed.value.label).
+                       hasLabel(VertexTypes.Execution.value.label).
+                       has('key', TextP.endingWith('_last_successful_execution')).fold()).as_('last_exec')
+        g = g.select('cluster', 'dashboard_group', 'dashboard', 'description', 'last_exec').\
+            by(unfold().valueMap().fold()).\
+            by(unfold().valueMap().fold()).\
+            by(valueMap()).\
+            by(unfold().valueMap().fold()).\
+            by(unfold().valueMap().fold())
+
+        results = self.query_executor()(query=g, get=FromResultSet.toList)
+        if not results:
+            # raise NotFoundException(f'User {user_id} does not {relation_type} any resources')
+            return {ResourceType.Dashboard.name.lower(): []}
+
+        dashboards = []
+        for r in results:
+            uri = ':'.join(_safe_get(r, 'dashboard', 'key').split(':')[1:])
+            dashboards.append(DashboardSummary(
+                uri=uri,
+                cluster=_safe_get(r, 'cluster', 'name'),
+                group_name=_safe_get(r, 'dashboard_group', 'name'),
+                group_url=_safe_get(r, 'dashboard_group', 'dashboard_group_url'),
+                product=uri.split('_')[0],
+                name=_safe_get(r, 'dashboard', 'name'),
+                url=_safe_get(r, 'dashboard', 'dashboard_url'),
+                description=_safe_get(r, 'description', 'description'),
+                last_successful_run_timestamp=_safe_get(r, 'last_exec')))
+
+        # this is weird but the convention
+        return {ResourceType.Dashboard.name.lower(): dashboards}
+
 
     # TODO: impl
     @timer_with_counter
@@ -1556,7 +1628,12 @@ class AbstractGremlinProxy(BaseProxy):
         vertex_type: VertexTypes = self._get_vertex_type_from_resource_type(resource_type=resource_type)
         edge_type: EdgeTypes = self._get_edge_type_from_user_resource_rel_type(relation=relation_type)
 
+        if ':' in id.split('://')[0]:
+            id = ':'.join(id.split(':')[1:])
+
         with self.query_executor() as executor:
+            _upsert(executor=executor, g=self.g, label=VertexTypes.User,
+                    key_property_name=self.key_property_name, key=user_id)
             _link(executor=executor, g=self.g, edge_label=edge_type, key_property_name=self.key_property_name,
                   vertex1_label=VertexTypes.User, vertex1_key=user_id,
                   vertex2_label=vertex_type, vertex2_key=id)
@@ -1579,10 +1656,97 @@ class AbstractGremlinProxy(BaseProxy):
 
     @timer_with_counter
     @overrides
-    def get_dashboard(self,
-                      dashboard_uri: str,
-                      ) -> DashboardDetailEntity:
-        pass
+    def get_dashboard(self, id: str) -> DashboardDetailEntity:
+        g = _V(g=self.g, label=VertexTypes.Dashboard, key=id).as_('dashboard')
+        g = g.out(EdgeTypes.DashboardOf.value.label).\
+            hasLabel(VertexTypes.Dashboardgroup.value.label).as_('dashboard_group')
+        g = g.out(EdgeTypes.DashboardGroupOf.value.label).\
+            hasLabel(VertexTypes.Cluster.value.label).as_('cluster')
+        g = g.coalesce(
+            select('dashboard')
+                .out(EdgeTypes.Description.value.label)
+                .has(VertexTypes.Description.value.label, 'source', 'user')
+                .fold(),
+            select('dashboard')
+                .out(EdgeTypes.Description.value.label)
+                .has(VertexTypes.Description.value.label, 'source', 'description')
+                .fold(),
+        ).as_('description')
+        g = g.coalesce(select('dashboard').out(EdgeTypes.Executed.value.label).
+                       hasLabel(VertexTypes.Execution.value.label).
+                       has('key', TextP.endingWith('_last_execution')).fold()).as_('last_exec')
+        g = g.coalesce(select('dashboard').out(EdgeTypes.Executed.value.label).
+                       hasLabel(VertexTypes.Execution.value.label).
+                       has('key', TextP.endingWith('_last_successful_execution')).fold()).as_('last_successful_exec')
+        g = g.coalesce(select('dashboard').out(EdgeTypes.LastUpdatedAt.value.label).
+                       hasLabel(VertexTypes.Timestamp.value.label).fold()).as_('t')
+        g = g.coalesce(select('dashboard').out(EdgeTypes.Owner.value.label).
+                       hasLabel(VertexTypes.User.value.label).fold()).as_('owners')
+        g = g.coalesce(select('dashboard').in_(EdgeTypes.Tag.value.label).
+                       hasLabel(VertexTypes.Tag.value.label).fold()).as_('tags')
+        g = g.coalesce(select('dashboard').out(EdgeTypes.HasBadge.value.label).
+                       hasLabel(VertexTypes.Badge.value.label).fold()).as_('badges')
+        g = g.coalesce(select('dashboard').out(EdgeTypes.HasQuery.value.label).
+                       hasLabel(VertexTypes.Query.value.label).fold()).as_('queries')
+        g = g.coalesce(select('dashboard').out(EdgeTypes.HasQuery.value.label).hasLabel(VertexTypes.Query.value.label).
+                       out(EdgeTypes.HasChart.value.label).hasLabel(VertexTypes.Chart.value.label).fold()).as_('charts')
+        g = g.coalesce(select('dashboard').out(EdgeTypes.DashboardWithTable.value.label).
+                       hasLabel(VertexTypes.Table.value.label).as_('table').in_(EdgeTypes.Table.value.label).
+                       hasLabel(VertexTypes.Schema.value.label).as_('schema').in_(EdgeTypes.Schema.value.label).
+                       hasLabel(VertexTypes.Cluster.value.label).as_('cluster').in_(EdgeTypes.Cluster.value.label).
+                       hasLabel(VertexTypes.Database.value.label).as_('database').
+                       coalesce(select('table').out(EdgeTypes.Description.value.label).
+                                hasLabel(VertexTypes.Description.value.label).fold()).as_('table_description').
+                       valueMap().fold()).as_('tables')
+        g = g.select('dashboard', 'dashboard_group', 'cluster', 'description', 'last_exec', 'last_successful_exec',
+                     't', 'owners', 'tags', 'badges', 'queries', 'charts', 'tables').\
+        by(valueMap()).\
+        by(unfold().dedup().valueMap().fold()).\
+        by(unfold().dedup().valueMap().fold()).\
+        by(unfold().dedup().valueMap().fold()).\
+        by(unfold().dedup().valueMap().fold()).\
+        by(unfold().dedup().valueMap().fold()).\
+        by(unfold().dedup().valueMap().fold()).\
+        by(unfold().dedup().valueMap().fold()).\
+        by(unfold().dedup().valueMap().fold()).\
+        by(unfold().dedup().valueMap().fold()).\
+        by(unfold().dedup().valueMap().fold()).\
+        by(unfold().dedup().valueMap().fold()).\
+        by(unfold().dedup().valueMap().fold())
+
+        results = self.query_executor()(query=g, get=FromResultSet.toList)
+
+        if not results:
+            raise NotFoundException(f'Dashboard URI( {id} ) does not exist')
+
+        uri = ':'.join(_safe_get(results, 'dashboard', 'key').split(':')[1:])
+
+        d = DashboardDetailEntity(
+            uri=uri,
+            cluster=_safe_get(results, 'cluster', 'name'),
+            group_name=_safe_get(results, 'dashboard_group', 'name'),
+            group_url=_safe_get(results, 'dashboard_group', 'dashboard_group_url'),
+            product=uri.split('_')[0],
+            name=_safe_get(results, 'dashboard', 'name'),
+            url=_safe_get(results, 'dashboard', 'dashboard_url'),
+            description=_safe_get(results, 'description'),
+            created_timestamp=_safe_get(results, 'dashboard', 'created_timestamp'),
+            updated_timestamp=_safe_get(results, 'dashboard', 'created_timestamp'),
+            last_successful_run_timestamp=_safe_get(results, 'last_success_exec'),
+            last_run_timestamp=_safe_get(results, 'last_exec'),
+            last_run_state=_safe_get(results, 'last_exec', 'state'),
+            owners=_safe_get_list(results, 'owners', transform=self._convert_to_user) or [],
+            frequent_users=[],
+            chart_names=[],
+            queries=[],
+            tables=[],
+            tags=_safe_get_list(results, 'tags', transform=self._convert_to_tag) or [],
+            badges=_safe_get_list(results, 'badges') or [],
+            recent_view_count=0
+        )
+
+        return d
+
 
     @timer_with_counter
     @overrides
@@ -1595,7 +1759,15 @@ class AbstractGremlinProxy(BaseProxy):
     def put_dashboard_description(self, *,
                                   id: str,
                                   description: str) -> None:
-        pass
+        description = unquote(description)
+        id = ':'.join(id.split(':')[1:])
+        desc_key = make_description_uri(subject_uri=id, source='user')
+        with self.query_executor() as executor:
+            _upsert(executor=executor, g=self.g, label=VertexTypes.Description, key=desc_key,
+                    key_property_name=self.key_property_name, description=description, source='user')
+            _link(executor=executor, g=self.g, edge_label=EdgeTypes.Description, key_property_name=self.key_property_name,
+                  vertex1_label=VertexTypes.Dashboard, vertex1_key=id,
+                  vertex2_label=VertexTypes.Description, vertex2_key=desc_key)
 
     @timer_with_counter
     @overrides
@@ -1713,6 +1885,8 @@ class AbstractGremlinProxy(BaseProxy):
             return VertexTypes.Table
         elif resource_type == ResourceType.User:
             return VertexTypes.User
+        elif resource_type == ResourceType.Dashboard:
+            return VertexTypes.Dashboard
 
         raise NotImplementedError(f"Don't know how to handle ResourceType={resource_type}")
 
